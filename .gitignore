@@ -1,0 +1,41 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+backend/.venv/
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ML artifacts and local data
+*.joblib
+*.pkl
+*.model
+# Raw source datasets
+data/raw/*
+!data/raw/.gitkeep

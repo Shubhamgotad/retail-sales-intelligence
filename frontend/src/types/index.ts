@@ -1,0 +1,14 @@
+export type Summary = { total_transactions: number; units_sold: number; total_revenue: number; total_profit: number; average_order_value: number };
+export type MonthlySale = { month: string; revenue: number; profit: number; units_sold: number; transactions: number };
+export type CategorySale = { category: string; revenue: number; profit: number; units_sold: number };
+export type RegionSale = { region: string; revenue: number; profit: number; units_sold: number };
+export type TopProduct = { product_id: string; product_name: string; category: string; units_sold: number; revenue: number; profit: number };
+export type Product = TopProduct & { subcategory: string; brand: string; unit_cost: number; unit_price: number };
+export type DemandRow = { product_id: number; product_name: string; last_observed_month: string; last_month_units: number; predicted_demand: string };
+export type DemandResponse = { algorithm: string; target: string; training_rows: number; training_accuracy: number; class_thresholds_units: Record<string, number | string>; predictions: DemandRow[]; note: string };
+export type ClusterRow = { product_id: number; product_name: string; category: string; cluster: number; units_sold: number; revenue: number; profit: number };
+export type ClusterGroup = { cluster: number; product_count: number; total_revenue: number; total_units_sold: number; products: string[] };
+export type ClusterResponse = { algorithm: string; features: string[]; cluster_count: number; clusters: ClusterGroup[]; products: ClusterRow[] };
+export type FrequentItemset = { items: string[]; support: number };
+export type BasketResponse = { algorithm: string; transaction_count: number; multi_item_transaction_count: number; frequent_itemsets: FrequentItemset[]; rules: BasketRule[]; message?: string };
+export type BasketRule = { antecedents: string[]; consequents: string[]; support: number; confidence: number; lift: number };
