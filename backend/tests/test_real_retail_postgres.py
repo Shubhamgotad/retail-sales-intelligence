@@ -14,6 +14,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.scripts.load_real_retail import split_sql_statements
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DDL_PATH = PROJECT_ROOT / "database" / "real_retail_schema.sql"
 DISPOSABLE_ENV = "REAL_RETAIL_TEST_DATABASE_URL"
@@ -60,88 +62,8 @@ def _test_database_url() -> str:
 
 
 
-def _split_sql_statements(sql: str) -> list[str]:
-    """Split SQL at statement terminators outside comments and quoted text."""
-    statements: list[str] = []
-    start = 0
-    index = 0
-    quote: str | None = None
-    dollar_tag: str | None = None
-    length = len(sql)
-
-    while index < length:
-        if dollar_tag is not None:
-            if sql.startswith(dollar_tag, index):
-                index += len(dollar_tag)
-                dollar_tag = None
-            else:
-                index += 1
-            continue
-
-        if quote is not None:
-            if sql[index] == "\\" and quote == "'":
-                index += 2
-                continue
-            if sql[index] == quote:
-                if index + 1 < length and sql[index + 1] == quote:
-                    index += 2
-                else:
-                    quote = None
-                    index += 1
-            else:
-                index += 1
-            continue
-
-        if sql.startswith("--", index):
-            newline = sql.find("\n", index + 2)
-            comment_end = length if newline == -1 else newline + 1
-            if not sql[start:index].strip():
-                start = comment_end
-            index = comment_end
-            continue
-        if sql.startswith("/*", index):
-            end = sql.find("*/", index + 2)
-            if end == -1:
-                raise ValueError("Unterminated SQL block comment")
-            comment_end = end + 2
-            if not sql[start:index].strip():
-                start = comment_end
-            index = comment_end
-            continue
-        if sql[index] in {"'", '"'}:
-            quote = sql[index]
-            index += 1
-            continue
-        if sql[index] == "$":
-            end = sql.find("$", index + 1)
-            if end != -1:
-                candidate = sql[index : end + 1]
-                if candidate == "$$" or (
-                    candidate[1:-1].replace("_", "a").isalnum()
-                    and candidate[1:-1][0].isalpha()
-                ):
-                    dollar_tag = candidate
-                    index = end + 1
-                    continue
-        if sql[index] == ";":
-            statement = sql[start:index].strip()
-            if statement:
-                statements.append(statement)
-            start = index + 1
-        index += 1
-
-    if quote is not None:
-        raise ValueError("Unterminated SQL quoted string")
-    if dollar_tag is not None:
-        raise ValueError("Unterminated SQL dollar-quoted string")
-    trailing = sql[start:].strip()
-    if trailing:
-        statements.append(trailing)
-    return statements
-
-
 def _statements() -> list[str]:
-    statements = _split_sql_statements(DDL_PATH.read_text(encoding="utf-8"))
+    statements = split_sql_statements(DDL_PATH.read_text(encoding="utf-8"))
     assert statements
     return statements
 
@@ -153,7 +75,7 @@ def test_statement_parser_ignores_comments_and_quoted_semicolons():
         SELECT 'literal;value', "identifier;value";
         DO $$ BEGIN RAISE NOTICE 'body;value'; END $$;
     """
-    assert _split_sql_statements(sql) == [
+    assert split_sql_statements(sql) == [
         "SELECT 'literal;value', \"identifier;value\"",
         "DO $$ BEGIN RAISE NOTICE 'body;value'; END $$",
     ]
@@ -174,11 +96,20 @@ def disposable_connection():
         # The real-retail DDL intentionally references the existing staging
         # lineage table. This minimal prerequisite is created inside the
         # transaction and is rolled back with all test objects and records.
-        connection.execute(text("""
-            CREATE TABLE public.stg_online_retail_source_rows (
-                staging_row_id BIGINT PRIMARY KEY
+        staging_exists = connection.execute(text("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'stg_online_retail_source_rows'
             )
-        """))
+        """)).scalar_one()
+        if not staging_exists:
+            connection.execute(text("""
+                CREATE TABLE public.stg_online_retail_source_rows (
+                    staging_row_id BIGINT PRIMARY KEY
+                )
+            """))
         yield connection
     finally:
         transaction.rollback()
@@ -193,29 +124,58 @@ def _execute_ddl(connection) -> None:
 
 def test_real_retail_ddl_twice_and_constraints(disposable_connection):
     connection = disposable_connection
+    existing_count = connection.execute(
+        text("SELECT COUNT(*) FROM real_retail.sales_lines")
+    ).scalar_one() if connection.dialect.has_table(
+        connection, "sales_lines", schema="real_retail"
+    ) else 0
     _execute_ddl(connection)
-    connection.execute(text("""
+    real_load_id = connection.execute(text("""
         INSERT INTO real_retail.loads (
             source_filename, source_sha256, staging_load_id,
             transformation_policy_version, status, rows_read, rows_loaded
         ) VALUES (
             'fixture.xlsx', :checksum, 1, 'test-policy', 'completed', 1, 1
         )
-    """), {"checksum": "a" * 64})
+        RETURNING real_load_id
+    """), {"checksum": "e" * 64}).scalar_one()
+    product_key = "INTEGRATION-FIXTURE-PRODUCT"
+    customer_key = "INTEGRATION-FIXTURE-CUSTOMER"
     connection.execute(text("""
         INSERT INTO real_retail.source_products (
             source_product_key, first_seen_real_load_id, last_seen_real_load_id
-        ) VALUES ('SKU-1', 1, 1)
-    """))
+        ) VALUES (:key, :load_id, :load_id)
+    """), {"key": product_key, "load_id": real_load_id})
     connection.execute(text("""
         INSERT INTO real_retail.source_customers (
             source_customer_key, first_seen_real_load_id, last_seen_real_load_id
-        ) VALUES ('CUSTOMER-1', 1, 1)
-    """))
+        ) VALUES (:key, :load_id, :load_id)
+    """), {"key": customer_key, "load_id": real_load_id})
+    staging_row_id = connection.execute(text("""
+        SELECT COALESCE(MAX(staging_row_id), 0) + 1
+        FROM public.stg_online_retail_source_rows
+    """)).scalar_one()
     connection.execute(text("""
-        INSERT INTO public.stg_online_retail_source_rows (staging_row_id)
-        VALUES (10)
-    """))
+        INSERT INTO public.stg_online_retail_source_rows (
+            staging_row_id, load_id, source_filename, source_sha256,
+            worksheet_name, worksheet_row_number,
+            is_cancellation_invoice, is_potential_return,
+            is_negative_price_anomaly, is_zero_price_line,
+            is_missing_customer_id, is_missing_description,
+            is_possible_duplicate_content, quality_classifications,
+            source_content_hash
+        ) VALUES (
+            :staging_row_id, 1, 'integration-fixture.xlsx', :checksum,
+            'Integration', :worksheet_row_number,
+            FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+            '[]'::jsonb, :content_hash
+        )
+    """), {
+        "staging_row_id": staging_row_id,
+        "checksum": "f" * 64,
+        "worksheet_row_number": 1000000,
+        "content_hash": "a" * 64,
+    })
     connection.execute(text("""
         INSERT INTO real_retail.sales_lines (
             real_load_id, staging_row_id, source_sha256, worksheet_name,
@@ -225,16 +185,24 @@ def test_real_retail_ddl_twice_and_constraints(disposable_connection):
             is_missing_customer, is_missing_description, is_possible_duplicate,
             source_content_hash
         ) VALUES (
-            1, 10, :checksum, 'Year 2010-2011', 2, 'SKU-1', 'CUSTOMER-1',
-            -2, 0, TRUE, TRUE, TRUE, FALSE, FALSE, TRUE, TRUE, :content_hash
+            :load_id, :staging_row_id, :checksum, 'Year 2010-2011', 2,
+            :product_key, :customer_key, -2, 0, TRUE, TRUE, TRUE, FALSE,
+            FALSE, TRUE, TRUE, :content_hash
         )
-    """), {"checksum": "a" * 64, "content_hash": "b" * 64})
+    """), {
+        "load_id": real_load_id,
+        "staging_row_id": staging_row_id,
+        "checksum": "e" * 64,
+        "product_key": product_key,
+        "customer_key": customer_key,
+        "content_hash": "f" * 64,
+    })
 
     # A second execution must be harmless and must preserve the fixture rows.
     _execute_ddl(connection)
     assert connection.execute(
         text("SELECT COUNT(*) FROM real_retail.sales_lines")
-    ).scalar_one() == 1
+    ).scalar_one() == existing_count + 1
 
     tables = connection.execute(text("""
         SELECT table_schema, table_name
@@ -271,12 +239,13 @@ def test_real_retail_ddl_twice_and_constraints(disposable_connection):
 def test_real_retail_constraints_reject_bad_values(disposable_connection):
     connection = disposable_connection
     _execute_ddl(connection)
-    connection.execute(text("""
+    load_id = connection.execute(text("""
         INSERT INTO real_retail.loads (
             source_filename, source_sha256, staging_load_id,
             transformation_policy_version, status
         ) VALUES ('fixture.xlsx', :checksum, 1, 'test-policy', 'running')
-    """), {"checksum": "c" * 64})
+        RETURNING real_load_id
+    """), {"checksum": "d" * 64}).scalar_one()
 
     with pytest.raises(SQLAlchemyError):
         with connection.begin_nested():
@@ -288,10 +257,10 @@ def test_real_retail_constraints_reject_bad_values(disposable_connection):
                     is_missing_customer, is_missing_description, is_possible_duplicate,
                     source_content_hash
                 ) VALUES (
-                    1, :checksum, 'Sheet', 2, 1, 'GBP', FALSE, FALSE, FALSE, FALSE,
+                    :load_id, :checksum, 'Sheet', 2, 1, 'GBP', FALSE, FALSE, FALSE, FALSE,
                     TRUE, FALSE, FALSE, :content_hash
                 )
-            """), {"checksum": "c" * 64, "content_hash": "d" * 64})
+            """), {"load_id": load_id, "checksum": "d" * 64, "content_hash": "e" * 64})
 
     connection.execute(text("""
         INSERT INTO real_retail.sales_lines (
@@ -301,10 +270,10 @@ def test_real_retail_constraints_reject_bad_values(disposable_connection):
             is_missing_customer, is_missing_description, is_possible_duplicate,
             source_content_hash
         ) VALUES (
-            1, :checksum, 'Sheet', 2, -3, 'UNKNOWN', FALSE, TRUE, FALSE, FALSE,
+            :load_id, :checksum, 'Sheet', 2, -3, 'UNKNOWN', FALSE, TRUE, FALSE, FALSE,
             TRUE, FALSE, FALSE, :content_hash
         )
-    """), {"checksum": "c" * 64, "content_hash": "d" * 64})
+    """), {"load_id": load_id, "checksum": "d" * 64, "content_hash": "e" * 64})
 
     with pytest.raises(SQLAlchemyError):
         with connection.begin_nested():
@@ -316,10 +285,10 @@ def test_real_retail_constraints_reject_bad_values(disposable_connection):
                     is_missing_customer, is_missing_description, is_possible_duplicate,
                     source_content_hash
                 ) VALUES (
-                    1, :checksum, 'Sheet', 2, -3, 'UNKNOWN', FALSE, TRUE, FALSE, FALSE,
+                    :load_id, :checksum, 'Sheet', 2, -3, 'UNKNOWN', FALSE, TRUE, FALSE, FALSE,
                     TRUE, FALSE, FALSE, :content_hash
                 )
-            """), {"checksum": "c" * 64, "content_hash": "e" * 64})
+            """), {"load_id": load_id, "checksum": "d" * 64, "content_hash": "f" * 64})
 
 
 def test_real_retail_foreign_keys_reject_invalid_references(disposable_connection):

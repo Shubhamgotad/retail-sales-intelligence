@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS real_retail.loads (
     source_filename TEXT NOT NULL,
     source_sha256 CHAR(64) NOT NULL,
     staging_load_id BIGINT NOT NULL,
-    transformation_policy_version VARCHAR(40) NOT NULL,
+    transformation_policy_version VARCHAR(80) NOT NULL,
     currency_code VARCHAR(20) NOT NULL DEFAULT 'UNKNOWN',
     status VARCHAR(20) NOT NULL,
     started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -34,6 +34,26 @@ CREATE TABLE IF NOT EXISTS real_retail.source_customers (
     source_customer_key TEXT PRIMARY KEY,
     first_seen_real_load_id BIGINT NOT NULL REFERENCES real_retail.loads(real_load_id),
     last_seen_real_load_id BIGINT NOT NULL REFERENCES real_retail.loads(real_load_id)
+);
+
+CREATE TABLE IF NOT EXISTS real_retail.product_unit_costs (
+    product_unit_cost_id BIGSERIAL PRIMARY KEY,
+    source_product_key TEXT NOT NULL
+        REFERENCES real_retail.source_products(source_product_key),
+    unit_cost NUMERIC(18, 6) NOT NULL,
+    currency_code CHAR(3) NOT NULL,
+    effective_from DATE NOT NULL,
+    effective_to DATE,
+    source_reference TEXT NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_real_retail_product_cost_nonnegative
+        CHECK (unit_cost >= 0),
+    CONSTRAINT ck_real_retail_product_cost_currency_length
+        CHECK (CHAR_LENGTH(currency_code) = 3),
+    CONSTRAINT ck_real_retail_product_cost_period
+        CHECK (effective_to IS NULL OR effective_to >= effective_from),
+    CONSTRAINT uq_real_retail_product_cost_start
+        UNIQUE (source_product_key, currency_code, effective_from)
 );
 
 CREATE TABLE IF NOT EXISTS real_retail.sales_lines (

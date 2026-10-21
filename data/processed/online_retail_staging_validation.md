@@ -35,7 +35,7 @@ This report contains aggregate diagnostics only. Raw customer values and custome
 
 ## Quantity and monetary totals
 
-Monetary totals are `Quantity × Price` in the source currency; no GBP assumption or conversion was made.
+Monetary totals are `Quantity × Price` in GBP, as specified by the UCI Online Retail II documentation for `UnitPrice`; no conversion is applied.
 The inclusion categories are mutually exclusive for reporting, using precedence: cancellation invoice,
 potential return, negative-price anomaly, zero-price line, then positive nonzero price.
 

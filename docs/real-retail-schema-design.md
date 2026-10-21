@@ -11,7 +11,7 @@ production warehouse or synthetic seed data is changed.
 the `real_retail` schema idempotently:
 
 - `real_retail.loads`: source checksum, filename, staging load ID, policy
-  version, `UNKNOWN` currency, status, timestamps, and row counters.
+  version, legacy `UNKNOWN` currency marker, status, timestamps, and row counters.
 - `real_retail.source_products`: normalized `StockCode`, nullable source
   description, and description-quality flag.
 - `real_retail.source_customers`: normalized source `Customer ID` only; no
@@ -21,7 +21,11 @@ the `real_retail` schema idempotently:
   uniqueness constraint on checksum + worksheet + worksheet row.
 
 There are no cost, profit, discount, store, customer-name, or converted-currency
-columns. `currency_code` is constrained to `UNKNOWN`.
+columns. The historical `currency_code` marker is constrained to `UNKNOWN`.
+The UCI Online Retail II documentation defines `UnitPrice` in sterling (£);
+read-only analytics therefore report `GBP` metadata without changing stored
+rows or applying a currency conversion. See the
+[UCI dataset documentation](https://archive.ics.uci.edu/dataset/502/online+retail+ii).
 
 ## Transformation policy
 
@@ -31,6 +35,9 @@ uses policy version:
 ```text
 online-retail-v1-unknown-currency-signed-quantity
 ```
+
+The load ledger reserves up to 80 characters for policy versions so the
+declared policy identifier is stored without truncation.
 
 Source identifiers are trimmed, internal whitespace is collapsed, and
 upper-cased. Excel-style integer customer values such as `123.0` normalize to
@@ -89,7 +96,7 @@ to PostgreSQL, read the workbook, or execute the schema file.
 - failed and incomplete statuses cannot be treated as completed; and
 - non-completed statuses cannot carry `completed_at`.
 
-The current SQL DDL enforces column nullability, `UNKNOWN` currency, source-line
+The current SQL DDL enforces column nullability, the legacy `UNKNOWN` stored-currency marker, source-line
 and load identity uniqueness, and foreign keys. It does **not** enforce the
 cross-column count equation, status transitions, completion timestamps, or the
 rejected-row policy. Those rules therefore remain application-level checks
@@ -99,7 +106,7 @@ until a later, explicitly approved schema change.
 summaries. It verifies source-line identity and signed quantity preservation,
 retains duplicate-content rows, counts cancellation and negative-quantity
 candidates separately, preserves missing customer/description classifications,
-requires `UNKNOWN` currency, and rejects supplied fabricated cost, profit,
+requires the legacy `UNKNOWN` currency marker, and rejects supplied fabricated cost, profit,
 store, discount, or converted-currency values. It returns named checks with
 observed and expected values plus an overall `ready` decision.
 
@@ -111,3 +118,27 @@ Run the pure tests safely from `backend/`:
 
 These tests do not require a database and do not perform a staging or
 production load.
+
+## Disposable end-to-end integration
+
+The read-only source verification and disposable destination loader are
+implemented in
+[`backend/app/scripts/load_real_retail.py`](../backend/app/scripts/load_real_retail.py).
+It requires `REAL_RETAIL_TEST_DATABASE_URL` to target the local database
+`retail_sales_test_disposable`; it never falls back to `DATABASE_URL` for
+writes. The source `DATABASE_URL` is accepted only when it targets the local
+`retail_sales_db`, and is used in read-only transactions.
+
+Run it from `backend/` after setting the disposable URL in the process
+environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.scripts.load_real_retail --staging-load-id 1
+```
+
+The runner validates the staged load and workbook checksum, copies staging
+lineage and transformed rows in bounded batches, reconciles exact Decimal
+quantities and monetary totals plus quality flags, and marks the isolated load
+completed only after all checks pass. A matching completed load is reconciled
+on rerun instead of duplicated. Any failed first run rolls back the
+destination transaction.

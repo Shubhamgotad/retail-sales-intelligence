@@ -65,9 +65,9 @@ Country: str
 
 - Currency columns found: none
 - Currency values found: none
-- The workbook does not encode a currency column. GBP is not independently confirmed by
-  the workbook itself; preserve `Price` as source currency and require source provenance
-  confirmation before labeling it GBP or converting it.
+- The workbook does not encode a currency column. The official UCI Online Retail II
+  documentation defines `UnitPrice` in sterling (£); report GBP without currency
+  conversion. See https://archive.ics.uci.edu/dataset/502/online+retail+ii.
 
 ## Warehouse mapping and incompatibilities
 
@@ -75,7 +75,7 @@ Country: str
 |---|---|---|
 | `StockCode` | `dim_product.product_id` (through a source-ID mapping) | available |
 | `Description` | `dim_product.product_name` | available, normalize carefully |
-| `Price` | `fact_sales.unit_price` | available; currency unconfirmed |
+| `Price` | `fact_sales.unit_price` | available; GBP per UCI documentation |
 | `Quantity` | `fact_sales.quantity` | available only after return/cancellation policy |
 | `Invoice` | `fact_sales.transaction_id` | available; preserve cancellation marker |
 | `InvoiceDate` | `dim_date.full_date` / `date_id` | available |
@@ -84,7 +84,7 @@ Country: str
 | product cost | `dim_product.unit_cost` / `fact_sales.cost_amount` | missing |
 | store | `dim_store` / `fact_sales.store_id` | missing |
 | profit | `fact_sales.profit` | missing; do not invent |
-| currency | none | missing from workbook |
+| currency | none | GBP documented by UCI; no per-row field in workbook |
 
 The current backend uses raw SQL queries through SQLAlchemy sessions; the SQLAlchemy
 warehouse model module is currently empty. The current warehouse also requires non-null
@@ -100,7 +100,7 @@ or an approved unknown-dimension policy is required before production-table chan
    source transaction-line key. Keep cancellations, returns, zero prices, and missing IDs.
 3. Validate required fields, date parsing, duplicate source lines, product mappings, and
    invoice-level basket consistency before any production insert.
-4. Obtain business decisions for currency provenance, cost/profit, store, customer handling,
+4. Obtain business decisions for cost/profit, store, customer handling,
    returns, and whether country should become a region dimension.
 5. Build deterministic product and customer source-ID mappings, then reconcile row counts and
    monetary totals. Only after review should a versioned import populate production tables.

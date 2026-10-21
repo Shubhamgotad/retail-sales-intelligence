@@ -47,14 +47,16 @@ Each source row retains its original values and receives explicit flags for:
 - missing description;
 - possible duplicate content: the complete source row content occurs more than once.
 
-Cancellation and return rows are retained. No currency is assumed or converted,
-and no cost, profit, store, customer identity, or product dimension record is
-created by this phase.
+Cancellation and return rows are retained. The UCI Online Retail II
+documentation defines `UnitPrice` in sterling (£), so source monetary values
+are GBP; no conversion is applied. No cost, profit, store, customer identity,
+or product dimension record is created by this phase.
 
 ## Limitations and review gate
 
 The workbook does not provide product cost, profit, store, or an explicit
-currency field. The current production fact table also requires positive
-quantities and non-negative amounts, so production mapping requires approved
-business policies for returns, currency provenance, missing customers, and
-unknown stores. This phase does not make those decisions.
+per-row currency field. GBP is sourced from the official UCI dataset
+documentation, not a workbook currency column. The current production fact
+table also requires positive quantities and non-negative amounts, so production
+mapping requires approved business policies for returns, missing customers,
+and unknown stores. This phase does not make those decisions.

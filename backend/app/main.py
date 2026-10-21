@@ -7,6 +7,8 @@ from app.api.basket_analysis import router as basket_router
 from app.api.classification import router as classification_router
 from app.api.clustering import router as clustering_router
 from app.api.products import router as products_router
+from app.api.real_retail_analytics import router as real_retail_analytics_router
+from app.api.real_retail_features import router as real_retail_features_router
 from app.db.session import engine
 
 app = FastAPI(
@@ -20,6 +22,8 @@ app.include_router(clustering_router)
 app.include_router(classification_router)
 app.include_router(basket_router)
 app.include_router(products_router)
+app.include_router(real_retail_analytics_router)
+app.include_router(real_retail_features_router)
 
 
 @app.get("/", tags=["System"])
