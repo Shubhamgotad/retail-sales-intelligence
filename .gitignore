@@ -37,5 +37,4 @@ Thumbs.db
 *.pkl
 *.model
 # Raw source datasets
-data/raw/*
 !data/raw/.gitkeep
