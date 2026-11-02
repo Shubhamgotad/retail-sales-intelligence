@@ -34,7 +34,6 @@ Thumbs.db
 
 # ML artifacts and local data
 *.joblib
-*.pkl
 *.model
 # Raw source datasets
 !data/raw/.gitkeep
