@@ -6,6 +6,8 @@ import type { RealRetailProduct } from "../types";
 import { ErrorState } from "./Dashboard";
 import { formatCompactNumber, formatGBP } from "../utils/format";
 import { isValidProductDescription } from "../utils/productDescription";
+import { PRODUCT_SEARCH_DEBOUNCE_MS, scheduleDebounced } from "../utils/debounce";
+import { createRequestSequence } from "../utils/requestSequence";
 
 type ProductView = {
   id: string;
@@ -36,41 +38,58 @@ export default function ProductExplorer() {
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [reloadCount, setReloadCount] = useState(0);
-  const requestId = useRef(0);
+  const requestSequence = useRef(createRequestSequence());
+  const loadMoreController = useRef<AbortController | null>(null);
+  const searchTerm = query.trim();
 
   useEffect(() => {
-    const current = ++requestId.current;
+    const current = requestSequence.current.next();
+    const controller = new AbortController();
+    loadMoreController.current?.abort();
+    loadMoreController.current = null;
     setError("");
     setItems([]);
     setPage(0);
-    setLoading(true);
-    const timer = window.setTimeout(() => {
-      const request = api.realRetail.products("value", 200, 0, query)
+    setLoading(false);
+    setLoadingMore(false);
+    const cancelDebounce = scheduleDebounced(() => {
+      setLoading(true);
+      const request = api.realRetail.products("value", 200, 0, searchTerm, controller.signal)
         .then((rows) => rows.map(fromReal).filter((item): item is ProductView => item !== null));
       request.then((nextItems) => {
-        if (current === requestId.current) setItems(nextItems);
+        if (requestSequence.current.isCurrent(current)) setItems(nextItems);
       }).catch((e: Error) => {
-        if (current === requestId.current) setError(e.message);
+        if (requestSequence.current.isCurrent(current) && !controller.signal.aborted) setError(e.message);
       }).finally(() => {
-        if (current === requestId.current) setLoading(false);
+        if (requestSequence.current.isCurrent(current)) setLoading(false);
       });
-    }, query.trim() ? 250 : 0);
-    return () => window.clearTimeout(timer);
-  }, [query, reloadCount]);
+    }, searchTerm ? PRODUCT_SEARCH_DEBOUNCE_MS : 0);
+    return () => {
+      cancelDebounce();
+      controller.abort();
+      loadMoreController.current?.abort();
+      requestSequence.current.invalidate(current);
+    };
+  }, [searchTerm, reloadCount]);
 
   const loadMore = () => {
     if (loadingMore || items.length < 200) return;
-    const current = requestId.current;
+    const current = requestSequence.current.next();
+    const controller = new AbortController();
+    loadMoreController.current = controller;
     setLoadingMore(true);
-    api.realRetail.products("value", 200, items.length, query).then((rows) => {
-      if (current === requestId.current) setItems((existing) => [
+    api.realRetail.products("value", 200, items.length, searchTerm, controller.signal).then((rows) => {
+      if (requestSequence.current.isCurrent(current)) setItems((existing) => [
         ...existing,
         ...rows.map(fromReal).filter((item): item is ProductView => item !== null),
       ]);
     }).catch((e: Error) => {
-      if (current === requestId.current) setError(e.message);
+      if (requestSequence.current.isCurrent(current) && !controller.signal.aborted) setError(e.message);
     }).finally(() => {
-      if (current === requestId.current) setLoadingMore(false);
+      if (requestSequence.current.isCurrent(current)) {
+        setLoadingMore(false);
+        if (loadMoreController.current === controller) loadMoreController.current = null;
+      }
     });
   };
 

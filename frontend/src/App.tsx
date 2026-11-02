@@ -4,6 +4,8 @@ import { Boxes, ChevronDown, CircleHelp, LayoutDashboard, Menu, Network, Search,
 import { api } from "./services/api";
 import type { RealRetailCountry, RealRetailProduct } from "./types";
 import { isValidProductDescription } from "./utils/productDescription";
+import { PRODUCT_SEARCH_DEBOUNCE_MS, scheduleDebounced } from "./utils/debounce";
+import { createRequestSequence } from "./utils/requestSequence";
 import Dashboard from "./pages/Dashboard";
 import ProductExplorer from "./pages/ProductExplorer";
 import DemandAnalysis from "./pages/DemandAnalysis";
@@ -23,13 +25,17 @@ type SearchResult = { kind: "product" | "region"; name: string; detail: string }
 function HeaderSearch() {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLocaleLowerCase();
   const [regions, setRegions] = useState<string[]>([]);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [activeIndex, setActiveIndex] = useState(-1);
-  const requestId = useRef(0);
+  const requestSequence = useRef(createRequestSequence());
+  const lastLoadedQuery = useRef<string | null>(null);
+  const regionsRef = useRef(regions);
+  regionsRef.current = regions;
   useEffect(() => {
     if (!open || regions.length) return;
     let active = true;
@@ -40,34 +46,59 @@ function HeaderSearch() {
   }, [open, regions.length]);
 
   useEffect(() => {
-    const normalized = query.trim().toLocaleLowerCase();
     setActiveIndex(-1);
-    if (!open || normalized.length < 2) {
+    if (normalizedQuery.length < 2) {
+      lastLoadedQuery.current = null;
       setResults([]);
       setLoading(false);
       return;
     }
-    const request = ++requestId.current;
-    const timeout = window.setTimeout(() => {
+    if (!open) {
+      setLoading(false);
+      return;
+    }
+    if (lastLoadedQuery.current === normalizedQuery) return;
+    const request = requestSequence.current.next();
+    const controller = new AbortController();
+    lastLoadedQuery.current = null;
+    setResults([]);
+    setLoading(false);
+    setError("");
+    const cancelDebounce = scheduleDebounced(() => {
       setLoading(true);
-      setError("");
-      api.realRetail.products("value", 10, 0, query).then((rows: RealRetailProduct[]) => rows
-        .filter((row) => isValidProductDescription(row.source_description))
-        .map((row) => ({
-          kind: "product" as const,
-          name: row.source_description as string,
-          detail: row.source_product_key ? `Product · ID ${row.source_product_key}` : "Product",
-        }))).then((matchedProducts) => {
-        if (request !== requestId.current) return;
-        const matchedRegions = regions.filter((region) => region.toLocaleLowerCase().includes(normalized)).slice(0, 5)
-          .map((name) => ({ kind: "region" as const, name, detail: "Country · Overview" }));
+      api.realRetail.products("value", 10, 0, normalizedQuery, controller.signal)
+        .then((rows: RealRetailProduct[]) => rows
+          .filter((row) => isValidProductDescription(row.source_description))
+          .map((row) => ({
+            kind: "product" as const,
+            name: row.source_description as string,
+            detail: row.source_product_key ? `Product · ID ${row.source_product_key}` : "Product",
+          })))
+        .then((matchedProducts) => {
+          if (!requestSequence.current.isCurrent(request)) return;
+          const matchedRegions = regionsRef.current
+            .filter((region) => region.toLocaleLowerCase().includes(normalizedQuery))
+            .slice(0, 5)
+            .map((name) => ({ kind: "region" as const, name, detail: "Country · Overview" }));
         setResults([...matchedProducts, ...matchedRegions]);
-      }).catch((e: Error) => {
-        if (request === requestId.current) { setResults([]); setError(e.message); }
-      }).finally(() => { if (request === requestId.current) setLoading(false); });
-    }, 250);
-    return () => window.clearTimeout(timeout);
-  }, [query, open, regions]);
+          lastLoadedQuery.current = normalizedQuery;
+        })
+        .catch((e: Error) => {
+          if (requestSequence.current.isCurrent(request) && !controller.signal.aborted) {
+            setResults([]);
+            setError(e.message);
+          }
+        })
+        .finally(() => {
+          if (requestSequence.current.isCurrent(request)) setLoading(false);
+        });
+    }, PRODUCT_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelDebounce();
+      controller.abort();
+      requestSequence.current.invalidate(request);
+    };
+  }, [normalizedQuery, open]);
 
   const choose = (result: SearchResult) => {
     setOpen(false);
@@ -82,7 +113,7 @@ function HeaderSearch() {
     else if (event.key === "Enter" && activeIndex >= 0) { event.preventDefault(); choose(results[activeIndex]); }
   };
 
-  return <div className="global-search"><div className="search"><Search size={17} /><input aria-label="Search products and regions" aria-expanded={open} aria-controls="global-search-results" aria-activedescendant={activeIndex >= 0 ? `global-search-result-${activeIndex}` : undefined} role="combobox" placeholder="Search products, regions..." value={query} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onKeyDown={onKeyDown} />{query && <button type="button" aria-label="Clear search" onClick={() => { setQuery(""); setResults([]); }}>×</button>}</div>
+  return <div className="global-search"><div className="search"><Search size={17} /><input aria-label="Search products and regions" aria-expanded={open} aria-controls="global-search-results" aria-activedescendant={activeIndex >= 0 ? `global-search-result-${activeIndex}` : undefined} role="combobox" placeholder="Search products, regions..." value={query} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onKeyDown={onKeyDown} />{query && <button type="button" aria-label="Clear search" onClick={() => { setQuery(""); setResults([]); lastLoadedQuery.current = null; }}>×</button>}</div>
     {open && query.trim().length >= 2 && <div className="global-search-results" id="global-search-results" role="listbox" aria-label="Search results">
       {loading && <div className="search-status">Searching…</div>}
       {!loading && error && <div className="search-status search-error">{error}</div>}

@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
+import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api } from "../services/api";
-import type { RealRetailDemandResponse } from "../types";
+import { ApiError, api } from "../services/api";
+import type { RandomForestDemandForecast, RealRetailDemandResponse, RealRetailProduct } from "../types";
 import { ErrorState } from "./Dashboard";
 import { formatCompactNumber } from "../utils/format";
 import { paginate } from "../utils/pagination";
 import { isValidProductDescription } from "../utils/productDescription";
+import { PRODUCT_SEARCH_DEBOUNCE_MS, scheduleDebounced } from "../utils/debounce";
+import { createRequestSequence } from "../utils/requestSequence";
 
 type DemandView = { id: string; name: string; month: string; units: number; label: string };
 type DemandSort = "name" | "units" | "month" | "class";
@@ -62,6 +64,143 @@ const demandColors: Record<string, string> = {
   medium: "#a27a45",
   low: "#8c7565",
 };
+
+type ForecastProduct = { productCode: string; productName: string };
+
+export function normalizeForecastProduct(product: RealRetailProduct): ForecastProduct | null {
+  if (!product.source_product_key || !isValidProductDescription(product.source_description)) return null;
+  return { productCode: product.source_product_key, productName: product.source_description };
+}
+
+export function DemandForecastSection() {
+  const [search, setSearch] = useState("");
+  const [selectedProduct, setSelectedProduct] = useState<ForecastProduct | null>(null);
+  const [matches, setMatches] = useState<ForecastProduct[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [forecast, setForecast] = useState<RandomForestDemandForecast | null>(null);
+  const [forecastError, setForecastError] = useState("");
+  const [forecastLoading, setForecastLoading] = useState(false);
+  const searchRequests = useRef(createRequestSequence());
+  const forecastRequests = useRef(createRequestSequence());
+
+  useEffect(() => {
+    const current = searchRequests.current.next();
+    const controller = new AbortController();
+    const term = search.trim();
+    setSearchError("");
+    setMatches([]);
+    if (selectedProduct || term.length < 2) {
+      setSearchLoading(false);
+      return () => {
+        controller.abort();
+        searchRequests.current.invalidate(current);
+      };
+    }
+
+    const cancelDebounce = scheduleDebounced(() => {
+      setSearchLoading(true);
+      api.realRetail.products("value", 10, 0, term, controller.signal).then((products) => {
+        const valid = products.map(normalizeForecastProduct)
+          .filter((product): product is ForecastProduct => product !== null);
+        if (searchRequests.current.isCurrent(current)) setMatches(valid);
+      }).catch((error: unknown) => {
+        if (searchRequests.current.isCurrent(current) && !controller.signal.aborted) {
+          setSearchError(error instanceof Error ? error.message : "Product search is unavailable.");
+        }
+      }).finally(() => {
+        if (searchRequests.current.isCurrent(current)) setSearchLoading(false);
+      });
+    }, PRODUCT_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelDebounce();
+      controller.abort();
+      searchRequests.current.invalidate(current);
+    };
+  }, [search, selectedProduct]);
+
+  const onSearchChange = (value: string) => {
+    setSearch(value);
+    setSelectedProduct(null);
+    setForecast(null);
+    setForecastError("");
+    setSearchLoading(false);
+    forecastRequests.current.next();
+    setForecastLoading(false);
+  };
+
+  const requestForecast = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const productCode = selectedProduct?.productCode ?? search.trim();
+    if (!productCode) {
+      setForecast(null);
+      setForecastError("Search for a product or enter its product code.");
+      return;
+    }
+    const current = forecastRequests.current.next();
+    setForecast(null);
+    setForecastError("");
+    setForecastLoading(true);
+    api.realRetail.demandForecast(productCode).then((result) => {
+      if (forecastRequests.current.isCurrent(current)) setForecast(result);
+    }).catch((error: unknown) => {
+      if (!forecastRequests.current.isCurrent(current)) return;
+      if (error instanceof ApiError && error.status === 404) {
+        setForecastError("This product is not supported by the saved model, or has no valid description.");
+      } else if (error instanceof ApiError && error.status === 422) {
+        setForecastError(error.message);
+      } else if (error instanceof ApiError && error.status === 503) {
+        setForecastError(`The Random Forest model is unavailable. ${error.message}`);
+      } else {
+        setForecastError("The forecast service is unavailable. Check that FastAPI is running and try again.");
+      }
+    }).finally(() => {
+      if (forecastRequests.current.isCurrent(current)) setForecastLoading(false);
+    });
+  };
+
+  const selectProduct = (product: ForecastProduct) => {
+    setSelectedProduct(product);
+    setSearch(product.productCode);
+    setMatches([]);
+    setSearchError("");
+    setForecast(null);
+    setForecastError("");
+    forecastRequests.current.next();
+    setForecastLoading(false);
+  };
+
+  return <section className="page-section random-forest-forecast">
+    <div className="section-intro"><div><h2>Random Forest Demand Forecast</h2><p>Request a monthly product-quantity estimate from the pre-trained Random Forest regressor.</p></div></div>
+    <form className="filters demand-forecast-form" onSubmit={requestForecast}>
+      <label className="filter-search">Search product names or enter a product code
+        <input aria-label="Search product names or enter a product code" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="Product name or code" maxLength={128} />
+      </label>
+      <button className="button primary" type="submit" disabled={forecastLoading || !search.trim()}>{forecastLoading ? "Forecasting..." : "Get forecast"}</button>
+    </form>
+    {searchLoading && <div className="loading-state" role="status">Searching products...</div>}
+    {searchError && <div className="inline-error" role="alert">{searchError}</div>}
+    {matches.length > 0 && <ul className="apriori-recommendation-list" aria-label="Matching products">
+      {matches.map((product) => <li key={product.productCode}>
+        <span>{product.productName}</span>
+        <small>Product code: {product.productCode}</small>
+        <button className="button secondary" type="button" onClick={() => selectProduct(product)}>Select</button>
+      </li>)}
+    </ul>}
+    {selectedProduct && <div className="apriori-selected-product">
+      <span>Selected product</span>
+      <b>{selectedProduct.productName}</b>
+      <small>Product code: {selectedProduct.productCode}</small>
+    </div>}
+    {forecastError && <div className="inline-error" role="alert">{forecastError}</div>}
+    {forecast && <div className="panel demand-forecast-result" role="status">
+      <div className="panel-head"><div><h3>{forecast.product_name}</h3><small>Product code: {forecast.product_code}</small></div></div>
+      <p>Forecast month: <b>{forecast.forecast_month}</b></p>
+      <p>Predicted monthly quantity: <b>{formatCompactNumber(forecast.predicted_monthly_quantity)} units</b></p>
+    </div>}
+    <p className="disclaimer">This is a monthly quantity estimate, not a demand class. Forecasts require at least three eligible monthly observations and a product code represented in the saved model. Historical model evaluation metrics do not guarantee accuracy for live products.</p>
+  </section>;
+}
 
 export default function DemandAnalysis() {
   const [rows, setRows] = useState<DemandView[]>([]);
@@ -119,10 +258,11 @@ export default function DemandAnalysis() {
     setPage(1);
   };
 
-  if (error) return <ErrorState message={error} retry={load} />;
-  if (loading) return <div className="loading-state">Loading demand signals…</div>;
+  const forecastSection = <DemandForecastSection />;
+  if (error) return <>{forecastSection}<ErrorState message={error} retry={load} /></>;
+  if (loading) return <>{forecastSection}<div className="loading-state">Loading demand signals…</div></>;
 
-  return <section className="page-section">
+  return <>{forecastSection}<section className="page-section">
     <div className="section-intro"><div><h2>Demand signals</h2><p>Demand classes derived from the returned product classifications.</p></div><span className="count-badge">{formatCompactNumber(rows.length)} products analyzed</span></div>
     <section className="demand-summary" aria-label="Demand summary">
       <div className="demand-summary-card"><span>Total products analyzed</span><strong>{formatCompactNumber(rows.length)}</strong></div>
@@ -137,5 +277,5 @@ export default function DemandAnalysis() {
     {selectedClass && <div className="disclaimer demand-filter-note">Showing {selectedClass} demand products from the chart selection.</div>}
     <div className="table-panel"><table><thead><tr><th>Product</th><th>Observed month</th><th>Last month units</th><th>Demand class</th></tr></thead><DemandTableRows rows={current.rows} /></table>{!filtered.length && <div className="empty-state">{rows.length ? "No products match the selected filters." : message || "No predictions are available for the current sales history."}</div>}</div>
     <div className="pagination"><button className="button secondary" disabled={current.page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>Previous</button><span>{current.start}-{current.end} of {formatCompactNumber(filtered.length)} · Page {current.page} of {current.pageCount}</span><button className="button secondary" disabled={current.page >= current.pageCount} onClick={() => setPage((value) => Math.min(current.pageCount, value + 1))}>Next</button></div>
-  </section>;
+  </section></>;
 }

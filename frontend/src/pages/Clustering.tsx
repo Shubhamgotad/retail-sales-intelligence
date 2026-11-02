@@ -29,6 +29,12 @@ export const clusterColor = (cluster: number) => clusterColors[cluster % cluster
 
 export function normalizeCustomerClusters(data: RealRetailClusterResponse) {
   return {
+    model: {
+      algorithm: data.algorithm,
+      type: data.model_type,
+      clusterCount: data.cluster_count,
+      features: data.features,
+    },
     groups: data.clusters.map((item) => ({
       cluster: item.cluster,
       count: item.customer_count,
@@ -51,7 +57,8 @@ export function normalizeCustomerClusters(data: RealRetailClusterResponse) {
       lines: item.line_count,
       exactPrimary: item.monetary_value,
     })),
-    note: `${data.note} Currency is GBP (£). Missing customer lines excluded: ${formatCompactNumber(data.excluded_missing_customer_lines)}.`,
+    message: data.message,
+    note: `${data.note} Currency is GBP (£). Missing customer lines excluded: ${formatCompactNumber(data.excluded_missing_customer_lines)}. Training-ineligible lines excluded: ${formatCompactNumber(data.excluded_training_ineligible_lines)}. Customers with invalid features excluded: ${formatCompactNumber(data.excluded_invalid_feature_customers)}.`,
   };
 }
 
@@ -80,9 +87,10 @@ export function toggleClusterSelection(current: number | null, clicked: number):
 export default function Clustering() {
   const [clusters, setClusters] = useState<ClusterView[]>([]);
   const [rows, setRows] = useState<ClusterView[]>([]);
-  const [count, setCount] = useState(3);
+  const [model, setModel] = useState<{ algorithm: string; type: string; clusterCount: number; features: string[] } | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [emptyMessage, setEmptyMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [selectedCluster, setSelectedCluster] = useState<number | null>(null);
   const [search, setSearch] = useState("");
@@ -90,18 +98,22 @@ export default function Clustering() {
   const [page, setPage] = useState(1);
   const requestId = useRef(0);
 
-  const load = (selectedCount: number) => {
+  const load = () => {
     const request = ++requestId.current;
     setError("");
     setNotice("");
     setLoading(true);
     setClusters([]);
     setRows([]);
+    setModel(null);
+    setEmptyMessage("");
     setSelectedCluster(null);
     setPage(1);
-    const result = api.realRetail.clusters(selectedCount).then(normalizeCustomerClusters);
+    const result = api.realRetail.clusters().then(normalizeCustomerClusters);
     result.then((data) => {
       if (request === requestId.current) {
+        setModel(data.model);
+        setEmptyMessage(data.message ?? "");
         setClusters(data.groups.map((group) => ({
           ...group, label: `Cluster ${group.cluster + 1}`, id: "", name: "",
           primary: 0, secondary: 0, category: "",
@@ -115,7 +127,7 @@ export default function Clustering() {
       if (request === requestId.current) setLoading(false);
     });
   };
-  useEffect(() => { load(count); }, [count]);
+  useEffect(() => { load(); }, []);
 
   const filtered = useMemo(
     () => filterAndSortClusterRows(rows, search, selectedCluster, sort),
@@ -135,10 +147,11 @@ export default function Clustering() {
     setPage(1);
   };
 
-  if (error && !clusters.length && !rows.length) return <ErrorState message={error} retry={() => load(count)} />;
+  if (error && !clusters.length && !rows.length) return <ErrorState message={error} retry={load} />;
   if (loading && !clusters.length && !rows.length) return <div className="loading-state">Loading customer clusters…</div>;
   return <section className="page-section">
-    <div className="section-intro"><div><h2>Customer clustering</h2><p>Group identifiable customers by invoice count, line count, signed quantity, and source monetary value. Each point represents one customer; select a cluster to filter the customer records.</p></div><label className="filter-control">Clusters<select aria-label="Number of clusters" value={count} disabled={loading} onChange={(event) => { const value = Number(event.target.value); setSelectedCluster(null); setPage(1); setCount(value); }}>{[2,3,4,5,6,7,8,9,10].map((value) => <option key={value} value={value}>{value} clusters</option>)}</select></label></div>
+    <div className="section-intro"><div><h2>Customer clustering</h2><p>Assign eligible customers with the saved K-Means model. Each point represents one customer; select a cluster to filter the customer records.</p></div></div>
+    {model && <div className="disclaimer"><b>{model.algorithm} · {model.type} · {model.clusterCount} clusters</b><br />Input features, in training order: {model.features.join(", ")}.</div>}
     {error && <div className="inline-error" role="alert">{error}</div>}
     {notice && <div className="subtle-note">{notice}</div>}
     <div className="cluster-grid">{clusters.map((cluster) => <div className="metric-card" key={cluster.cluster}><div className="metric-label"><i className="cluster-color-dot" style={{ background: clusterColor(cluster.cluster) }} />Cluster {cluster.cluster + 1}</div><strong>{formatCompactNumber(cluster.count)}</strong><small>customers · {formatGBP(cluster.exactPrimary ?? "0")}</small></div>)}</div>
@@ -148,7 +161,7 @@ export default function Clustering() {
     </div>
     <div className="filters cluster-filters"><label className="filter-search"><span className="sr-only">Search cluster records</span><input aria-label="Search customers" placeholder="Search customers..." value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} /></label><label className="filter-control">Sort by<select aria-label="Sort cluster records" value={sort} onChange={(event) => { setSort(event.target.value as ClusterSort); setPage(1); }}><option value="cluster">Cluster</option><option value="name">Customer ID</option><option value="primary">Source value</option><option value="secondary">Signed quantity</option></select></label>{selectedCluster !== null && <button className="button secondary" onClick={clearSelection}>Clear selection</button>}</div>
     {selectedCluster !== null && <div className="disclaimer cluster-selection-note">Showing customers in Cluster {selectedCluster + 1}.</div>}
-    <div className="table-panel cluster-records-table"><table><thead><tr><th>Customer ID</th><th>Cluster</th><th>Invoices</th><th>Lines</th><th>Signed quantity</th><th>Source value</th></tr></thead><tbody>{current.rows.map((row) => <tr key={row.id}><td><b>{row.name}</b><small>{row.id}</small></td><td><span className="cluster-table-label"><i style={{ background: clusterColor(row.cluster) }} />Cluster {row.cluster + 1}</span></td><td>{formatCompactNumber(row.invoices ?? 0)}</td><td>{formatCompactNumber(row.lines ?? 0)}</td><td>{formatCompactNumber(row.secondary)}</td><td>{formatGBP(row.exactPrimary ?? "0")}</td></tr>)}</tbody></table>{!filtered.length && <div className="empty-state">{rows.length ? "No records match your search." : "No customer cluster records are available."}</div>}</div>
+    <div className="table-panel cluster-records-table"><table><thead><tr><th>Customer ID</th><th>Cluster</th><th>Invoices</th><th>Lines</th><th>Eligible quantity</th><th>Source value</th></tr></thead><tbody>{current.rows.map((row) => <tr key={row.id}><td><b>{row.name}</b><small>{row.id}</small></td><td><span className="cluster-table-label"><i style={{ background: clusterColor(row.cluster) }} />Cluster {row.cluster + 1}</span></td><td>{formatCompactNumber(row.invoices ?? 0)}</td><td>{formatCompactNumber(row.lines ?? 0)}</td><td>{formatCompactNumber(row.secondary)}</td><td>{formatGBP(row.exactPrimary ?? "0")}</td></tr>)}</tbody></table>{!filtered.length && <div className="empty-state">{rows.length ? "No records match your search." : emptyMessage || "No customer cluster records are available."}</div>}</div>
     <div className="pagination"><button className="button secondary" disabled={current.page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>Previous</button><span>{current.start}-{current.end} of {formatCompactNumber(filtered.length)} · Page {current.page} of {current.pageCount}</span><button className="button secondary" disabled={current.page >= current.pageCount} onClick={() => setPage((value) => Math.min(current.pageCount, value + 1))}>Next</button></div>
   </section>;
 }

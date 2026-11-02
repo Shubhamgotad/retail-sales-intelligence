@@ -23,6 +23,8 @@ const basketPage = await vite.ssrLoadModule("/src/pages/BasketAnalysis.tsx");
 const App = (await vite.ssrLoadModule("/src/App.tsx")).default;
 const { paginate } = await vite.ssrLoadModule("/src/utils/pagination.ts");
 const { api } = await vite.ssrLoadModule("/src/services/api.ts");
+const { PRODUCT_SEARCH_DEBOUNCE_MS, scheduleDebounced } = await vite.ssrLoadModule("/src/utils/debounce.ts");
+const { createRequestSequence } = await vite.ssrLoadModule("/src/utils/requestSequence.ts");
 after(() => vite.close());
 
 test("formats long decimal strings without converting them through floating point", () => {
@@ -187,6 +189,36 @@ test("Demand table renderer excludes missing and placeholder descriptions", () =
   assert.match(markup, /16119/);
 });
 
+test("Random Forest forecast UI is separate and validates selected product descriptions", () => {
+  const markup = renderToStaticMarkup(createElement(demandPage.DemandForecastSection));
+  assert.match(markup, /Random Forest Demand Forecast/);
+  assert.match(markup, /monthly product-quantity estimate/);
+  assert.match(markup, /Search product names or enter a product code/);
+  assert.match(markup, /monthly quantity estimate, not a demand class/);
+  assert.deepEqual(demandPage.normalizeForecastProduct({
+    source_product_key: "001-AB",
+    source_description: "Tea & cup!",
+    line_count: 1,
+    missing_description_lines: 0,
+    potential_return_lines: 0,
+    zero_price_lines: 0,
+    quantity_total: "1",
+    monetary_total: "1",
+    currency_code: "GBP",
+  }), { productCode: "001-AB", productName: "Tea & cup!" });
+  assert.equal(demandPage.normalizeForecastProduct({
+    source_product_key: "BAD",
+    source_description: "??",
+    line_count: 1,
+    missing_description_lines: 0,
+    potential_return_lines: 0,
+    zero_price_lines: 0,
+    quantity_total: "1",
+    monetary_total: "1",
+    currency_code: "GBP",
+  }), null);
+});
+
 test("demand summary counts returned classifications and paginates filtered sorted data", () => {
   const rows = Array.from({ length: 123 }, (_, index) => ({
     id: String(index + 1),
@@ -246,13 +278,23 @@ test("cluster filtering and pagination follow returned assignments and selection
 test("customer-cluster normalization preserves source customer identity and assignments", () => {
   const normalized = clusteringPage.normalizeCustomerClusters({
     algorithm: "K-Means",
-    features: ["invoice_count", "line_count", "signed_quantity", "monetary_value"],
-    cluster_count: 1,
+    model_type: "Pre-trained",
+    features: ["Recency", "Frequency", "Monetary", "AvgOrderValue", "TotalQuantity"],
+    cluster_count: 2,
     excluded_missing_customer_lines: 2,
+    excluded_training_ineligible_lines: 3,
+    excluded_invalid_feature_customers: 0,
     currency_code: "GBP",
     clusters: [{ cluster: 0, customer_count: 1, total_monetary_value: "42.50", total_signed_quantity: -1, customers: ["100"] }],
     customers: [{ customer_id: "100", cluster: 0, invoice_count: 2, line_count: 3, signed_quantity: -1, monetary_value: "42.50" }],
+    message: null,
     note: "Source customer clustering.",
+  });
+  assert.deepEqual(normalized.model, {
+    algorithm: "K-Means",
+    type: "Pre-trained",
+    clusterCount: 2,
+    features: ["Recency", "Frequency", "Monetary", "AvgOrderValue", "TotalQuantity"],
   });
   assert.equal(normalized.rows[0].id, "100");
   assert.equal(normalized.rows[0].category, "Customer");
@@ -289,6 +331,142 @@ test("identical concurrent API requests share one network call without caching c
     assert.deepEqual(first, second);
     await api.realRetail.demand();
     assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Random Forest forecast API targets the dedicated endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (url) => {
+    requestedUrl = url;
+    return new Response(JSON.stringify({
+      algorithm: "Random Forest Regressor",
+      product_code: "85048",
+      product_name: "Tea & cup!",
+      forecast_month: "2011-01",
+      predicted_monthly_quantity: 12.5,
+      target: "Monthly product quantity",
+      input_features: [],
+      history_months_used: 3,
+      evaluation_metrics: { mae: 191.05, rmse: 421.44, r2: 0.23 },
+      note: "Evaluation metrics do not guarantee live-data accuracy.",
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const result = await api.realRetail.demandForecast(" 85048 ");
+    assert.match(requestedUrl, /\/api\/real-retail\/features\/demand-forecast\/85048$/);
+    assert.equal(result.product_code, "85048");
+    assert.equal(result.predicted_monthly_quantity, 12.5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rapid product search updates send one request after 350 ms", async () => {
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const timers = new Map();
+  let nextTimer = 0;
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  globalThis.window = {
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  try {
+    let cancel;
+    let request;
+    for (const term of ["g", "gi", "gir", "gir1", "tiffi", "tiffin"]) {
+      cancel?.();
+      cancel = scheduleDebounced(() => { request = api.realRetail.products("value", 10, 0, term); });
+    }
+
+    assert.equal(PRODUCT_SEARCH_DEBOUNCE_MS, 350);
+    assert.equal(timers.size, 1);
+    assert.equal(requests.length, 0);
+    const [{ callback, delay }] = timers.values();
+    assert.equal(delay, 350);
+    callback();
+    await request;
+    assert.equal(requests.length, 1);
+    assert.match(requests[0], /search=tiffin/);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("clearing product search cancels a pending debounce without leaving loading active", () => {
+  const originalWindow = globalThis.window;
+  const timers = new Map();
+  let nextTimer = 0;
+  globalThis.window = {
+    setTimeout(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  try {
+    let loading = false;
+    const cancel = scheduleDebounced(() => { loading = true; });
+    cancel();
+    assert.equal(timers.size, 0);
+    assert.equal(loading, false);
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
+test("a stale product search response cannot replace the latest result", async () => {
+  const requests = createRequestSequence();
+  const stale = requests.next();
+  let resolveStale;
+  const staleResponse = new Promise((resolve) => { resolveStale = resolve; })
+    .then((value) => { if (requests.isCurrent(stale)) result = value; });
+  const latest = requests.next();
+  let resolveLatest;
+  let result = "";
+  const latestResponse = new Promise((resolve) => { resolveLatest = resolve; })
+    .then((value) => { if (requests.isCurrent(latest)) result = value; });
+
+  resolveLatest("newer");
+  await latestResponse;
+  resolveStale("older");
+  await staleResponse;
+
+  assert.equal(result, "newer");
+  requests.invalidate(latest);
+  assert.equal(requests.isCurrent(latest), false);
+});
+
+test("product API requests honor AbortController cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  let receivedSignal;
+  globalThis.fetch = (_url, options) => new Promise((_resolve, reject) => {
+    receivedSignal = options.signal;
+    receivedSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+  });
+  const controller = new AbortController();
+  try {
+    const request = api.realRetail.products("value", 10, 0, "old term", controller.signal);
+    controller.abort();
+    assert.equal(receivedSignal, controller.signal);
+    await assert.rejects(request, { name: "AbortError" });
   } finally {
     globalThis.fetch = originalFetch;
   }

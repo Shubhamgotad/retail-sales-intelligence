@@ -14,10 +14,10 @@ from sqlalchemy.exc import SQLAlchemyError
 import pandas as pd
 from collections import Counter
 from itertools import combinations
-from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import StandardScaler
+
+from app.services import customer_clustering
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -586,30 +586,126 @@ def demand(connection: Connection) -> dict[str, Any]:
     }
 
 
-def customer_clusters(connection: Connection, n_clusters: int) -> dict[str, Any]:
+def customer_clusters(connection: Connection) -> dict[str, Any]:
+    artifacts = customer_clustering.load_customer_clustering_artifacts()
     rows = _rows(connection, """
-        SELECT source_customer_key AS customer_id,
-               COUNT(DISTINCT source_invoice) FILTER (WHERE source_invoice IS NOT NULL) AS invoice_count,
-               COUNT(*) AS line_count, SUM(signed_quantity) AS signed_quantity,
-               SUM(signed_quantity * source_price) AS monetary_value
-        FROM real_retail.sales_lines
-        WHERE source_customer_key IS NOT NULL
-        GROUP BY source_customer_key
-        ORDER BY source_customer_key
+        WITH eligible_sales AS (
+            SELECT source_customer_key,
+                   source_invoice,
+                   invoice_datetime,
+                   signed_quantity,
+                   signed_quantity * source_price AS line_amount
+            FROM real_retail.sales_lines
+            WHERE source_customer_key IS NOT NULL
+              AND invoice_datetime IS NOT NULL
+              AND signed_quantity > 0
+              AND source_price > 0
+        ),
+        reference_time AS (
+            SELECT MAX(invoice_datetime) + INTERVAL '1 day' AS reference_datetime
+            FROM eligible_sales
+        )
+        SELECT eligible_sales.source_customer_key AS customer_id,
+               FLOOR(EXTRACT(EPOCH FROM (
+                   reference_time.reference_datetime
+                   - MAX(eligible_sales.invoice_datetime)
+               )) / 86400)::INTEGER AS recency,
+               COUNT(DISTINCT eligible_sales.invoice_datetime) AS frequency,
+               SUM(eligible_sales.line_amount) AS monetary,
+               AVG(eligible_sales.line_amount) AS avgordervalue,
+               SUM(eligible_sales.signed_quantity) AS totalquantity,
+               COUNT(DISTINCT eligible_sales.source_invoice)
+                   FILTER (WHERE eligible_sales.source_invoice IS NOT NULL)
+                   AS invoice_count,
+               COUNT(*) AS line_count
+        FROM eligible_sales
+        CROSS JOIN reference_time
+        GROUP BY eligible_sales.source_customer_key,
+                 reference_time.reference_datetime
+        ORDER BY eligible_sales.source_customer_key
     """)
-    frame = pd.DataFrame(rows)
-    if frame.empty:
-        return {"clusters": [], "customers": [], "excluded_missing_customer_lines": 0, "currency_code": CURRENCY_CODE, "message": "No identifiable real-retail customers found."}
-    features = ["invoice_count", "line_count", "signed_quantity", "monetary_value"]
-    frame["monetary_value_exact"] = frame["monetary_value"].astype(str)
-    frame[features] = frame[features].astype(float)
-    k = min(max(1, n_clusters), len(frame))
-    labels = [0] * len(frame) if k == 1 else KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(StandardScaler().fit_transform(frame[features]))
-    frame["cluster"] = labels
-    clusters = [{"cluster": int(label_value), "customer_count": len(group), "total_monetary_value": str(sum((Decimal(value) for value in group["monetary_value_exact"]), Decimal(0))), "total_signed_quantity": float(group["signed_quantity"].sum()), "customers": group["customer_id"].tolist()} for label_value, group in frame.groupby("cluster")]
-    customers = [{"customer_id": str(row["customer_id"]), "cluster": int(row["cluster"]), "invoice_count": int(row["invoice_count"]), "line_count": int(row["line_count"]), "signed_quantity": float(row["signed_quantity"]), "monetary_value": row["monetary_value_exact"]} for row in frame.to_dict(orient="records")]
-    missing = int(_rows(connection, "SELECT COUNT(*) AS count FROM real_retail.sales_lines WHERE source_customer_key IS NULL")[0]["count"])
-    return {"algorithm": "K-Means", "features": features, "cluster_count": k, "excluded_missing_customer_lines": missing, "currency_code": CURRENCY_CODE, "clusters": clusters, "customers": customers, "note": "Clusters use identifiable source customers only; missing customer IDs are excluded and reported."}
+    exclusions = _rows(connection, """
+        SELECT COUNT(*) FILTER (
+                   WHERE source_customer_key IS NULL
+               ) AS excluded_missing_customer_lines,
+               COUNT(*) FILTER (
+                   WHERE source_customer_key IS NULL
+                      OR invoice_datetime IS NULL
+                      OR signed_quantity IS NULL
+                      OR signed_quantity <= 0
+                      OR source_price IS NULL
+                      OR source_price <= 0
+               ) AS excluded_training_ineligible_lines
+        FROM real_retail.sales_lines
+    """)[0]
+    valid_rows, labels, invalid_feature_count = (
+        customer_clustering.predict_customer_clusters(rows, artifacts)
+    )
+    grouped_rows: dict[int, list[dict[str, Any]]] = {}
+    for row, label in zip(valid_rows, labels):
+        grouped_rows.setdefault(label, []).append(row)
+
+    clusters = [
+        {
+            "cluster": label,
+            "customer_count": len(group),
+            "total_monetary_value": str(
+                sum(
+                    (Decimal(str(row["monetary"])) for row in group),
+                    Decimal(0),
+                )
+            ),
+            "total_signed_quantity": sum(
+                float(row["totalquantity"]) for row in group
+            ),
+            "customers": [str(row["customer_id"]) for row in group],
+        }
+        for label, group in sorted(grouped_rows.items())
+    ]
+    customers = [
+        {
+            "customer_id": str(row["customer_id"]),
+            "cluster": label,
+            "invoice_count": int(row["invoice_count"]),
+            "line_count": int(row["line_count"]),
+            "signed_quantity": float(row["totalquantity"]),
+            "monetary_value": str(row["monetary"]),
+        }
+        for label, group in sorted(grouped_rows.items())
+        for row in group
+    ]
+    return {
+        "algorithm": "K-Means",
+        "model_type": "Pre-trained",
+        "features": list(artifacts.features),
+        "cluster_count": artifacts.cluster_count,
+        "excluded_missing_customer_lines": int(
+            exclusions["excluded_missing_customer_lines"]
+        ),
+        "excluded_training_ineligible_lines": int(
+            exclusions["excluded_training_ineligible_lines"]
+        ),
+        "excluded_invalid_feature_customers": invalid_feature_count,
+        "currency_code": CURRENCY_CODE,
+        "clusters": clusters,
+        "customers": customers,
+        "message": (
+            "No customers have complete, positive features compatible with "
+            "the training preprocessing."
+            if not customers
+            else None
+        ),
+        "note": (
+            "Cluster counts and totals are calculated from the current eligible "
+            "real-retail data, not the model's original training summary. "
+            "Customers are aggregated using the notebook's definitions; lines "
+            "without a customer or invoice timestamp and lines with missing or "
+            "non-positive quantity or price are excluded, matching its training filters. "
+            "Frequency is the count of distinct invoice timestamps. Frequency, "
+            "Monetary, AvgOrderValue, and TotalQuantity are log1p-transformed "
+            "before the saved scaler is applied."
+        ),
+    }
 
 
 def baskets(connection: Connection, min_support: float, min_confidence: float) -> dict[str, Any]:

@@ -159,8 +159,10 @@ def test_real_feature_routes_are_registered():
     paths = set(app.openapi()["paths"])
     assert {
         "/api/real-retail/features/demand",
+        "/api/real-retail/features/demand-forecast/{product_code}",
         "/api/real-retail/features/clustering",
         "/api/real-retail/features/basket",
+        "/api/real-retail/features/recommendations/{product_code}",
     } <= paths
 
 
@@ -432,15 +434,39 @@ def test_real_product_search_uses_bound_case_insensitive_description_filter(monk
 
 def test_customer_cluster_monetary_values_keep_exact_decimal_strings(monkeypatch):
     customer_rows = [
-        {"customer_id": "100", "invoice_count": 2, "line_count": 3, "signed_quantity": -5, "monetary_value": "100.1000000000"},
-        {"customer_id": "200", "invoice_count": 3, "line_count": 8, "signed_quantity": 10, "monetary_value": "0.0000000001"},
+        {"customer_id": "100", "recency": 10, "frequency": 2, "monetary": "100.1000000000", "avgordervalue": "50.05", "totalquantity": 3, "invoice_count": 2, "line_count": 3},
+        {"customer_id": "200", "recency": 20, "frequency": 3, "monetary": "0.0000000001", "avgordervalue": "0.0000000001", "totalquantity": 8, "invoice_count": 3, "line_count": 8},
     ]
 
     def rows(_connection, query, _params=None):
-        return [{"count": 0}] if "COUNT(*) AS count" in query else customer_rows
+        if "WITH eligible_sales" in query:
+            return customer_rows
+        return [{
+            "excluded_missing_customer_lines": 0,
+            "excluded_training_ineligible_lines": 0,
+        }]
 
     monkeypatch.setattr(real_retail_analytics, "_rows", rows)
-    result = real_retail_analytics.customer_clusters(None, 2)
+    monkeypatch.setattr(
+        real_retail_analytics.customer_clustering,
+        "load_customer_clustering_artifacts",
+        lambda: SimpleNamespace(
+            features=(
+                "Recency",
+                "Frequency",
+                "Monetary",
+                "AvgOrderValue",
+                "TotalQuantity",
+            ),
+            cluster_count=2,
+        ),
+    )
+    monkeypatch.setattr(
+        real_retail_analytics.customer_clustering,
+        "predict_customer_clusters",
+        lambda rows, _artifacts: (rows, [0, 1], 0),
+    )
+    result = real_retail_analytics.customer_clusters(None)
     assert {customer["monetary_value"] for customer in result["customers"]} == {
         "100.1000000000",
         "0.0000000001",
